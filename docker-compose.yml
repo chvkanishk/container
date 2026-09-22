@@ -1,0 +1,6 @@
+services:
+  worker:
+    build: ./worker
+    env_file: .env
+    volumes: ["./config:/config:ro"]
+    restart: unless-stopped

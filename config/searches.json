@@ -1,0 +1,9 @@
+[
+  { "keyword": "data engineer",            "employment_types": ["CONTRACTS"] },
+  { "keyword": "databricks data engineer", "employment_types": ["CONTRACTS"] },
+  { "keyword": "data architect",           "employment_types": ["CONTRACTS"] },
+  { "keyword": "ETL developer",            "employment_types": ["CONTRACTS"] },
+  { "keyword": "AWS data engineer",        "employment_types": ["CONTRACTS"] },
+  { "keyword": "Azure data engineer",      "employment_types": ["CONTRACTS"] },
+  { "keyword": "business analyst",         "employment_types": ["CONTRACTS"] }
+]
