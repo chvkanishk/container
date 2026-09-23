@@ -3,6 +3,11 @@
 Two laptops (A and B) take turns searching Dice and save new postings into a
 shared Supabase Postgres database. No duplicates: Dice's job id is the primary key.
 
+## One-time database setup
+
+Open Supabase > SQL Editor and run `schema.sql`. It creates the `baton`,
+`runs` and `jobs` tables and the single baton row. It is safe to re-run.
+
 ## Setup on each laptop
 
 1. git clone this repo
@@ -20,7 +25,7 @@ shared Supabase Postgres database. No duplicates: Dice's job id is the primary k
 ## Settings (.env)
 
     CYCLE_MINUTES    minutes between handoffs (5 for testing, 15 normal)
-    MAX_AGE_MINUTES  ignore postings older than this
+    MAX_AGE_MINUTES  ignore postings older than this (keep well above 4 x CYCLE_MINUTES)
 
 Keywords live in config/searches.json and must be the same on both laptops.
 

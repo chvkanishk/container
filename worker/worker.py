@@ -12,13 +12,18 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+
+# The library renamed this function between versions; accept either name.
+try:
+    from mcp.client.streamable_http import streamablehttp_client as http_client
+except ImportError:
+    from mcp.client.streamable_http import streamable_http_client as http_client
 
 NODE = os.getenv("NODE_NAME", "A").strip().upper()
 PARTNER = "B" if NODE == "A" else "A"
 DB_URL = os.environ["DATABASE_URL"]
 CYCLE_MIN = int(os.getenv("CYCLE_MINUTES", "15"))
-MAX_AGE_MIN = int(os.getenv("MAX_AGE_MINUTES", "60"))
+MAX_AGE_MIN = int(os.getenv("MAX_AGE_MINUTES", "120"))
 SEARCHES_FILE = os.getenv("SEARCHES_FILE", "/config/searches.json")
 DICE_URL = os.getenv("DICE_MCP_URL", "https://mcp.dice.com/mcp")
 JOBS_PER_PAGE = 50
@@ -31,6 +36,7 @@ logging.basicConfig(
     format=f"%(asctime)s [{NODE}] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)   # hide per-request lines
 log = logging.getLogger().info
 
 
@@ -114,54 +120,85 @@ def finish_run(run_id, checked, new_jobs, error=None):
 # Dice
 # --------------------------------------------------------------------------
 
+def parse_posted(value):
+    """Dice's postedDate as an aware UTC datetime, or None if unreadable."""
+    try:
+        posted = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if posted.tzinfo is None:          # no zone given: Dice times are UTC
+        posted = posted.replace(tzinfo=timezone.utc)
+    return posted
+
+
+async def search_keyword(session, search, cutoff):
+    """Return postings newer than `cutoff` for one search entry."""
+    keyword = search["keyword"]
+    found = []
+    for page in range(1, MAX_PAGES + 1):
+        args = {
+            **search,
+            "posted_date": "ONE",       # today (Dice's finest filter)
+            "sort": "datePosted",       # newest first
+            "jobs_per_page": JOBS_PER_PAGE,
+            "page_number": page,
+        }
+        result = await session.call_tool("search_jobs", args)
+        # mcp 2.x uses snake_case field names; 1.x used camelCase.
+        if getattr(result, "is_error", None) or getattr(result, "isError", None):
+            raise RuntimeError(f"Dice error for '{keyword}': {result.content}")
+
+        payload = (getattr(result, "structured_content", None)
+                   or getattr(result, "structuredContent", None)
+                   or json.loads(result.content[0].text))
+        payload = payload.get("result", payload)
+        jobs = payload.get("data", [])
+        if not jobs:
+            break
+
+        too_old = False
+        for job in jobs:
+            posted = parse_posted(job.get("postedDate"))
+            if posted and posted < cutoff:
+                too_old = True     # sorted newest first, so stop here
+                break
+            found.append(job)
+
+        if too_old or page >= payload.get("metadata", {}).get("totalPages", 1):
+            break
+        await asyncio.sleep(1)      # be polite to Dice
+    return found
+
+
 async def search_dice(cutoff):
-    """Return every posting newer than `cutoff`, across all keywords."""
+    """Search every keyword, saving as we go, so one failing keyword
+    does not throw away what the others found.
+
+    Returns (checked, new_jobs, errors).
+    """
     with open(SEARCHES_FILE) as f:
         searches = json.load(f)
 
-    found = []
-    async with streamablehttp_client(DICE_URL) as (read, write, _):
+    checked = new_jobs = 0
+    errors = []
+    async with http_client(DICE_URL) as streams:
+        read, write = streams[0], streams[1]   # some versions return a 3rd item
         async with ClientSession(read, write) as session:
             await session.initialize()
 
             for search in searches:
                 keyword = search["keyword"]
-                kept = 0
-                for page in range(1, MAX_PAGES + 1):
-                    args = {
-                        **search,
-                        "posted_date": "ONE",       # today (Dice's finest filter)
-                        "sort": "datePosted",       # newest first
-                        "jobs_per_page": JOBS_PER_PAGE,
-                        "page_number": page,
-                    }
-                    result = await session.call_tool("search_jobs", args)
-                    if result.isError:
-                        raise RuntimeError(f"Dice error for '{keyword}': {result.content}")
-
-                    payload = result.structuredContent or json.loads(result.content[0].text)
-                    payload = payload.get("result", payload)
-                    jobs = payload.get("data", [])
-                    if not jobs:
-                        break
-
-                    too_old = False
-                    for job in jobs:
-                        posted = job.get("postedDate")
-                        if posted and datetime.fromisoformat(
-                            posted.replace("Z", "+00:00")
-                        ) < cutoff:
-                            too_old = True     # sorted newest first, so stop here
-                            break
-                        found.append((keyword, job))
-                        kept += 1
-
-                    if too_old or page >= payload.get("metadata", {}).get("totalPages", 1):
-                        break
-                    await asyncio.sleep(1)      # be polite to Dice
-
-                log(f"  '{keyword}': {kept} recent")
-    return found
+                try:
+                    jobs = await search_keyword(session, search, cutoff)
+                    new_here = save(keyword, jobs)
+                except Exception as exc:
+                    errors.append(f"'{keyword}': {type(exc).__name__}: {exc}")
+                    log(f"  '{keyword}' failed: {type(exc).__name__}: {exc}")
+                    continue
+                checked += len(jobs)
+                new_jobs += new_here
+                log(f"  '{keyword}': {len(jobs)} recent, {new_here} new")
+    return checked, new_jobs, errors
 
 
 # --------------------------------------------------------------------------
@@ -178,20 +215,23 @@ INSERT = """
 """
 
 
-def save(postings):
+def save(keyword, jobs):
     """Insert postings, skipping any job_id already in the table."""
     new_count = 0
     with db() as conn:
-        for keyword, job in postings:
+        for job in jobs:
+            title, url = clean(job.get("title")), clean(job.get("detailsPageUrl"))
+            if not (job.get("guid") and title and url):
+                continue                # id, title and url are required columns
             row = conn.execute(INSERT, (
                 job["guid"],
-                clean(job.get("title")),
+                title,
                 clean(job.get("companyName")),
                 clean((job.get("jobLocation") or {}).get("displayName")),
                 clean(", ".join(job.get("workplaceTypes") or [])),
                 clean(job.get("employmentType")),
                 clean(job.get("salary")),
-                job.get("detailsPageUrl"),
+                url,
                 job.get("postedDate"),
                 clean(job.get("summary")),
                 keyword,
@@ -213,9 +253,9 @@ async def run_cycle():
     try:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=MAX_AGE_MIN)
         log(f"Searching Dice for postings since {cutoff:%H:%M} UTC")
-        postings = await search_dice(cutoff)
-        checked = len(postings)
-        new_jobs = save(postings)
+        checked, new_jobs, errors = await search_dice(cutoff)
+        if errors:
+            error = "; ".join(errors)[:1000]
         log(f"Checked {checked}, saved {new_jobs} new")
     except Exception as exc:                      # never let one bad run kill the loop
         error = f"{type(exc).__name__}: {exc}"[:1000]
